@@ -145,6 +145,16 @@ pub async fn provider(udid: &str) -> Result<impl IdeviceProvider> {
     Ok(device.to_provider(UsbmuxdAddr::default(), LABEL))
 }
 
+/// whether the phone is locked right now, lockdown's PasswordProtected flips as it locks and unlocks
+pub async fn locked(udid: &str) -> bool {
+    let Ok(provider) = provider(udid).await else { return false };
+    lockdown_value_in(&provider, "PasswordProtected", None)
+        .await
+        .ok()
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false)
+}
+
 pub async fn ios_major(provider: &dyn IdeviceProvider) -> Option<(u64, String)> {
     let ios = lockdown_string(provider, "ProductVersion").await?;
     let major = ios.split('.').next().and_then(|m| m.parse::<u64>().ok()).unwrap_or(0);

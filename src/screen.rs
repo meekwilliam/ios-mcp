@@ -21,6 +21,9 @@ use crate::{Error, Result, h264, phone};
 // device hub sends 140, the phone's own bigger mask gets an unusable video setup
 const CLIENT_FEATURES: u64 = 140;
 
+const INPUT: Duration = Duration::from_secs(3);
+const STALLED: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy)]
 pub enum Input {
     Touch { x: u16, y: u16 },
@@ -99,7 +102,7 @@ impl Session {
             commands,
             thread: Some(thread),
         };
-        match tokio::time::timeout(Duration::from_secs(60), started).await {
+        match tokio::time::timeout(Duration::from_secs(30), started).await {
             Ok(Ok(Ok(()))) => Ok(session),
             Ok(Ok(Err(e))) => Err(e),
             Ok(Err(_)) => Err(Error::Other(
@@ -187,6 +190,7 @@ async fn run(
     let mut broken = false;
     let mut setup = Setup::default();
     let mut waiting: Vec<oneshot::Sender<Vec<u8>>> = Vec::new();
+    let mut waiting_since: Option<Instant> = None;
 
     let result = loop {
         tokio::select! {
@@ -237,22 +241,35 @@ async fn run(
                     for reply in waiting.drain(..) {
                         let _ = reply.send(data.clone());
                     }
+                    waiting_since = None;
                 }
             }
             _ = alive.tick() => {
                 feedback.still_watching(&screen.video).await;
+                // the phone answers a key frame request within a few frames, silence means it stopped sending,
+                // ending here lets the next request start a fresh session instead of waiting forever
+                if waiting_since.is_some_and(|since| since.elapsed() > STALLED) {
+                    break Err(Error::Other("The iPhone stopped sending its screen.".into()));
+                }
                 if !waiting.is_empty() {
                     feedback.ask_for_key_frame(&screen.video, false).await;
                 }
             }
             command = commands.recv() => match command {
                 Some(Command::Input(input)) => {
-                    if let Err(e) = controls.send(input, &mut adapter, &mut handshake).await {
-                        eprintln!("Couldn't pass {input:?} to the iPhone: {e}");
+                    // a stuck send would stop the video and the feedback, and the phone ends the session 15 s later
+                    match tokio::time::timeout(INPUT, controls.send(input, &mut adapter, &mut handshake)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => eprintln!("Couldn't pass {input:?} to the iPhone: {e}"),
+                        Err(_) => {
+                            eprintln!("The iPhone didn't take {input:?} in time, reconnecting the controls.");
+                            controls = Controls::default();
+                        }
                     }
                 }
                 Some(Command::KeyFrame(reply)) => {
                     waiting.push(reply);
+                    waiting_since.get_or_insert_with(Instant::now);
                     feedback.ask_for_key_frame(&screen.video, true).await;
                 }
                 None => break Ok(()),

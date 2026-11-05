@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::{
-    Error, Result, apps, keys,
+    Error, Result, apps, keys, phone,
     picture::{self, Picture},
     screen::{Button, Input, Session},
 };
@@ -45,8 +45,23 @@ impl Phones {
     }
 
     pub async fn screenshot(&mut self, udid: &str) -> Result<Picture> {
+        let frame = match self.live(udid).await?.session.key_frame().await {
+            Ok(frame) => frame,
+            // a session the phone stopped sending on ends itself, a fresh one usually works straight away
+            Err(_) => {
+                self.live.remove(udid);
+                match self.live(udid).await?.session.key_frame().await {
+                    Ok(frame) => frame,
+                    Err(e) if phone::locked(udid).await => {
+                        return Err(Error::Other(format!(
+                            "{e} The iPhone is locked, unlock it and try again."
+                        )));
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        };
         let live = self.live(udid).await?;
-        let frame = live.session.key_frame().await?;
         let picture = tokio::task::spawn_blocking(move || picture::from_key_frame(&frame))
             .await
             .map_err(|e| Error::Other(e.to_string()))??;

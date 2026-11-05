@@ -9,13 +9,14 @@ use crate::{
     screen::{Button, Input, Session},
 };
 
-// a session keeps the phone's screen recording indicator on, so it closes once the agent goes quiet
-const IDLE: Duration = Duration::from_secs(120);
+// a session keeps the phone's screen recording indicator on, so it closes soon after the agent goes quiet
+const IDLE: Duration = Duration::from_secs(30);
 
 struct Live {
     session: Session,
     used: Instant,
     size: Option<(u32, u32)>,
+    link: Option<phone::Link>,
 }
 
 #[derive(Default)]
@@ -25,8 +26,16 @@ pub struct Phones {
 
 impl Phones {
     async fn live(&mut self, udid: &str) -> Result<&mut Live> {
+        let link = phone::link(udid).await;
         if self.live.get(udid).is_some_and(|l| !l.session.alive()) {
             self.live.remove(udid);
+        }
+        // wi-fi is only a fallback, a session started without the cable moves over once it's plugged in
+        if link == Some(phone::Link::Usb)
+            && self.live.get(udid).is_some_and(|l| l.link == Some(phone::Link::WiFi))
+            && let Some(old) = self.live.remove(udid)
+        {
+            old.session.stop().await;
         }
         if !self.live.contains_key(udid) {
             let session = Session::start(udid).await?;
@@ -36,6 +45,7 @@ impl Phones {
                     session,
                     used: Instant::now(),
                     size: None,
+                    link,
                 },
             );
         }
@@ -164,6 +174,10 @@ impl Phones {
                 live.session.stop().await;
             }
         }
+    }
+
+    pub fn connected(&self) -> usize {
+        self.live.len()
     }
 
     pub async fn close_all(&mut self) {

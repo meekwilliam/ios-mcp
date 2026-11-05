@@ -145,6 +145,24 @@ pub async fn provider(udid: &str) -> Result<impl IdeviceProvider> {
     Ok(device.to_provider(UsbmuxdAddr::default(), LABEL))
 }
 
+/// how the phone is reachable right now, the cable when it's on both
+pub async fn link(udid: &str) -> Option<Link> {
+    let found: Vec<Connection> = devices()
+        .await
+        .ok()?
+        .into_iter()
+        .filter(|d| d.udid == udid)
+        .map(|d| d.connection_type)
+        .collect();
+    if found.iter().any(|c| matches!(c, Connection::Usb)) {
+        Some(Link::Usb)
+    } else if found.iter().any(|c| matches!(c, Connection::Network(_))) {
+        Some(Link::WiFi)
+    } else {
+        None
+    }
+}
+
 /// whether the phone is locked right now, lockdown's PasswordProtected flips as it locks and unlocks
 pub async fn locked(udid: &str) -> bool {
     let Ok(provider) = provider(udid).await else { return false };

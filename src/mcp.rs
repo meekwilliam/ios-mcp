@@ -11,14 +11,15 @@ const PROTOCOL: &str = "2025-06-18";
 const INSTRUCTIONS: &str = "Controls a real iPhone connected to this computer. Start with screenshot to see the screen. \
 Coordinates for tap and swipe are pixels in the latest screenshot (the iPhone's points, (0, 0) is the top left). \
 To open an app use launch_app rather than hunting for its icon. Tap a text field before type_text. \
-Every tool works on the only connected iPhone unless you pass a udid from list_devices.";
+Every tool works on the only connected iPhone unless you pass a udid from list_devices. \
+When you've finished with the iPhone, call disconnect so it stops sharing its screen.";
 
 /// a model context protocol server on stdin and stdout, for claude code, cursor, codex and other agents
 pub async fn serve() -> Result<()> {
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     let mut phones = Phones::default();
-    let mut tidy = tokio::time::interval(Duration::from_secs(20));
+    let mut tidy = tokio::time::interval(Duration::from_secs(5));
     loop {
         let line = tokio::select! {
             line = lines.next_line() => line?,
@@ -112,6 +113,15 @@ async fn call(name: &str, args: &Value, phones: &mut Phones) -> Result<Vec<Value
             return Err(Error::NoPhone);
         }
         return Ok(vec![text(serde_json::to_string_pretty(&found).expect("json"))]);
+    }
+    if name == "disconnect" {
+        let count = phones.connected();
+        phones.close_all().await;
+        return Ok(vec![text(if count == 0 {
+            "Already disconnected from the iPhone.".to_string()
+        } else {
+            "Disconnected from the iPhone, it's no longer sharing its screen. Any other tool connects again.".to_string()
+        })]);
     }
     let udid = phone::pick(args.get("udid").and_then(Value::as_str)).await?;
     let udid = udid.as_str();
@@ -269,6 +279,11 @@ fn tools() -> Value {
                 "latitude": { "type": "number" },
                 "longitude": { "type": "number" },
             }), &["latitude", "longitude"]),
+        },
+        {
+            "name": "disconnect",
+            "description": "Call this when you've finished with the iPhone. It ends screen sharing, so the phone's screen recording indicator goes away. A simulated location stays until clear_location.",
+            "inputSchema": { "type": "object", "properties": {} },
         },
         {
             "name": "clear_location",

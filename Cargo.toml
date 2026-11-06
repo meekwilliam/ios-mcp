@@ -19,9 +19,11 @@ idevice = { version = "=0.1.68", default-features = false, features = [
     "mobile_image_mounter",
     "tss",
     "amfi",
+    "dvt",
 ] }
 tokio = { version = "1.54", features = ["rt-multi-thread", "rt", "macros", "fs", "time", "sync", "io-std", "io-util"] }
 plist = "1.10"
+ns-keyed-archive = "0.1.5"
 flate2 = "1.1"
 dirs = "7"
 uuid = { version = "1", features = ["v4"] }

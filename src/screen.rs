@@ -76,6 +76,7 @@ impl Button {
 enum Command {
     Input(Input),
     Current(oneshot::Sender<Shot>),
+    Latest(oneshot::Sender<Shot>),
 }
 
 /// frames to decode for the screen as it is, a lone key frame unless the phone wouldn't send one
@@ -174,6 +175,19 @@ impl Session {
             Ok(Err(_)) => Err(stopped()),
             Err(_) => Err(Error::Other("The iPhone didn't send a picture of its screen in time.".into())),
         }
+    }
+
+    /// every frame since the last key frame, which shows even a small change straight away, openh264 can smear a big
+    /// movement but a highlight box drawn on a still screen comes out right
+    pub async fn latest(&self) -> Result<Vec<Vec<u8>>> {
+        let (reply, shot) = oneshot::channel();
+        let stopped = || Error::Other("Screen sharing with the iPhone stopped. Try again.".into());
+        self.commands.send(Command::Latest(reply)).map_err(|_| stopped())?;
+        let shot = shot.await.map_err(|_| stopped())?;
+        if shot.frames.is_empty() {
+            return Err(Error::Other("The iPhone hasn't sent a picture of its screen yet.".into()));
+        }
+        Ok(shot.frames)
     }
 
     /// the screen as it is now, instant when it hasn't changed since the last key frame
@@ -391,6 +405,9 @@ async fn run(
                     }
                     // the phone's reports pile up unread while a send is stuck, that time isn't the phone going quiet
                     heard = heard.max(Instant::now() - Duration::from_secs(1));
+                }
+                Some(Command::Latest(reply)) => {
+                    let _ = reply.send(Shot { number: last, frames: run.clone() });
                 }
                 Some(Command::Current(reply)) => {
                     if !changed && !run.is_empty() {

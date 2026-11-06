@@ -4,7 +4,7 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::{Error, Result, apps, control::Phones, phone, picture::Picture, screen::Button};
+use crate::{Error, Result, accessibility, apps, control::Phones, phone, picture::Picture, screen::Button};
 
 const PROTOCOL: &str = "2025-06-18";
 
@@ -12,6 +12,7 @@ const INSTRUCTIONS: &str = "Controls a real iPhone connected to this computer. S
 tap, swipe, type_text, press_button and launch_app wait for the screen to settle and send back a screenshot of the result, so there's no need to take one after them. \
 Coordinates for tap and swipe are pixels in the latest screenshot (the iPhone's points, (0, 0) is the top left). \
 To open an app use launch_app rather than hunting for its icon. Tap a text field before type_text. \
+describe_screen lists the buttons and text on screen with where to tap them, when a screenshot leaves it unclear. \
 Every tool works on the only connected iPhone unless you pass a udid from list_devices. \
 When you've finished with the iPhone, call disconnect so it stops sharing its screen.";
 
@@ -149,6 +150,39 @@ async fn call(name: &str, args: &Value, phones: &mut Phones) -> Result<Vec<Value
     let done = |what: String| Ok(vec![text(what)]);
     match name {
         "screenshot" => Ok(image(&phones.screenshot(udid).await?)),
+        "describe_screen" => {
+            let found = accessibility::describe(phones, udid).await?;
+            if found.is_empty() {
+                return done(
+                    "The iPhone didn't list anything on this screen. Some games and video apps don't describe themselves, use screenshot instead."
+                        .into(),
+                );
+            }
+            let lines: Vec<String> = found
+                .iter()
+                .map(|e| {
+                    let mut line = format!("{:?}", e.label);
+                    if !e.role.is_empty() {
+                        line += &format!(" {}", e.role.to_lowercase());
+                    }
+                    if !e.value.is_empty() {
+                        line += &format!(", value {:?}", e.value);
+                    }
+                    match e.frame {
+                        Some((x, y, w, h)) => {
+                            line += &format!(", at ({x}, {y}) size {w} x {h}, tap ({}, {})", x + w / 2, y + h / 2)
+                        }
+                        None => line += ", position unknown",
+                    }
+                    line
+                })
+                .collect();
+            done(format!(
+                "{} things on screen, top to bottom, in screenshot points:\n{}",
+                found.len(),
+                lines.join("\n")
+            ))
+        }
         "tap" => {
             let (x, y) = (number(args, "x")?, number(args, "y")?);
             let hold = args.get("hold_ms").and_then(Value::as_u64).unwrap_or(60);
@@ -248,6 +282,12 @@ fn tools() -> Value {
         {
             "name": "screenshot",
             "description": "Shows the iPhone's screen as it is right now. Coordinates for tap and swipe are pixels in this image.",
+            "inputSchema": schema(json!({}), &[]),
+            "annotations": { "readOnlyHint": true },
+        },
+        {
+            "name": "describe_screen",
+            "description": "Lists what's on the iPhone's screen, like buttons, text and switches, with each one's label and where to tap it in screenshot points. Slower than a screenshot (a few seconds, more on busy screens), and a box briefly hops around the phone's screen while it reads. Off-screen items in a list need a swipe first.",
             "inputSchema": schema(json!({}), &[]),
             "annotations": { "readOnlyHint": true },
         },

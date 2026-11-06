@@ -1,3 +1,4 @@
+mod accessibility;
 mod apps;
 mod control;
 mod h264;
@@ -22,6 +23,7 @@ With no arguments it runs as an MCP server on stdin and stdout. Add it to Claude
 Or use it from the command line:
     ios-mcp devices
     ios-mcp screenshot <file.png>
+    ios-mcp elements
     ios-mcp tap <x> <y>
     ios-mcp swipe <from-x> <from-y> <to-x> <to-y>
     ios-mcp type <text>
@@ -93,6 +95,16 @@ async fn command(args: &[String]) -> Result<()> {
             }
             Err(e) => Err(e),
         },
+        ["elements"] => {
+            for e in accessibility::describe(&mut phones, udid).await? {
+                let frame = e
+                    .frame
+                    .map(|(x, y, w, h)| format!("{x} {y} {w} {h}"))
+                    .unwrap_or_else(|| "?".into());
+                println!("{frame}\t{}\t{}\t{}", e.role, e.label, e.value);
+            }
+            Ok(())
+        }
         ["tap", x, y] => {
             phones
                 .tap(udid, number(x)?, number(y)?, Duration::from_millis(60))

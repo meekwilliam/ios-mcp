@@ -7,6 +7,7 @@ use crate::{
     Error, Result, apps, keys, phone,
     picture::Picture,
     screen::{Button, Input, Session},
+    video,
 };
 
 // a session keeps the phone's screen recording indicator on, so it closes soon after the agent goes quiet
@@ -79,6 +80,17 @@ impl Phones {
     pub async fn settle(&mut self, udid: &str, longest: Duration) -> Result<()> {
         self.live(udid).await?.session.settle(longest).await;
         Ok(())
+    }
+
+    /// the screen's pixels in points, without the png a screenshot makes
+    pub async fn pixels(&mut self, udid: &str) -> Result<image::RgbImage> {
+        let live = self.live(udid).await?;
+        let frames = live.session.latest().await?;
+        let pixels = tokio::task::spawn_blocking(move || video::points(&frames))
+            .await
+            .map_err(|e| Error::Other(e.to_string()))??;
+        live.size = Some(pixels.dimensions());
+        Ok(pixels)
     }
 
     /// screenshot coordinates to the 0 to 65535 range the phone takes

@@ -444,6 +444,7 @@ dependencies = [
  "futures",
  "idevice",
  "image",
+ "ns-keyed-archive",
  "openh264",
  "plist",
  "serde",

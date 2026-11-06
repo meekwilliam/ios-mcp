@@ -6,6 +6,7 @@ mod mcp;
 mod phone;
 mod picture;
 mod screen;
+mod video;
 
 use std::time::Duration;
 

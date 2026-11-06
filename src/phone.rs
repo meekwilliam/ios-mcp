@@ -165,7 +165,9 @@ pub async fn link(udid: &str) -> Option<Link> {
 
 /// whether the phone is locked right now, lockdown's PasswordProtected flips as it locks and unlocks
 pub async fn locked(udid: &str) -> bool {
-    let Ok(provider) = provider(udid).await else { return false };
+    let Ok(provider) = provider(udid).await else {
+        return false;
+    };
     lockdown_value_in(&provider, "PasswordProtected", None)
         .await
         .ok()

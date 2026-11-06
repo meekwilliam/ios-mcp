@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     Error, Result, apps, keys, phone,
-    picture::{self, Picture},
+    picture::Picture,
     screen::{Button, Input, Session},
 };
 
@@ -55,13 +55,13 @@ impl Phones {
     }
 
     pub async fn screenshot(&mut self, udid: &str) -> Result<Picture> {
-        let frame = match self.live(udid).await?.session.key_frame().await {
-            Ok(frame) => frame,
+        let picture = match self.live(udid).await?.session.picture().await {
+            Ok(picture) => picture,
             // a session the phone stopped sending on ends itself, a fresh one usually works straight away
             Err(_) => {
                 self.live.remove(udid);
-                match self.live(udid).await?.session.key_frame().await {
-                    Ok(frame) => frame,
+                match self.live(udid).await?.session.picture().await {
+                    Ok(picture) => picture,
                     Err(e) if phone::locked(udid).await => {
                         return Err(Error::Other(format!(
                             "{e} The iPhone is locked, unlock it and try again."
@@ -71,12 +71,14 @@ impl Phones {
                 }
             }
         };
-        let live = self.live(udid).await?;
-        let picture = tokio::task::spawn_blocking(move || picture::from_key_frame(&frame))
-            .await
-            .map_err(|e| Error::Other(e.to_string()))??;
-        live.size = Some((picture.width, picture.height));
+        self.live(udid).await?.size = Some((picture.width, picture.height));
         Ok(picture)
+    }
+
+    /// waits until the screen stops changing, so a screenshot straight after shows the result
+    pub async fn settle(&mut self, udid: &str, longest: Duration) -> Result<()> {
+        self.live(udid).await?.session.settle(longest).await;
+        Ok(())
     }
 
     /// screenshot coordinates to the 0 to 65535 range the phone takes
@@ -104,7 +106,7 @@ impl Phones {
         session.send(Input::Touch { x, y })?;
         tokio::time::sleep(hold).await;
         session.send(Input::Lift { x, y })?;
-        settle().await;
+        session.settle(Duration::from_millis(1500)).await;
         Ok(())
     }
 
@@ -126,13 +128,15 @@ impl Phones {
             tokio::time::sleep(step).await;
         }
         session.send(Input::Lift { x: end.0, y: end.1 })?;
-        settle().await;
+        // a fling keeps a list moving for a while after the finger lifts
+        session.settle(Duration::from_millis(2500)).await;
         Ok(())
     }
 
     pub async fn press(&mut self, udid: &str, button: Button) -> Result<()> {
-        self.live(udid).await?.session.send(Input::Button(button))?;
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        let session = &self.live(udid).await?.session;
+        session.send(Input::Button(button))?;
+        session.settle(Duration::from_millis(2000)).await;
         Ok(())
     }
 
@@ -158,7 +162,7 @@ impl Phones {
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
         }
-        settle().await;
+        session.settle(Duration::from_millis(1500)).await;
         Ok(())
     }
 
@@ -185,9 +189,4 @@ impl Phones {
             live.session.stop().await;
         }
     }
-}
-
-// lets the phone finish reacting so a screenshot straight after shows the result
-async fn settle() {
-    tokio::time::sleep(Duration::from_millis(400)).await;
 }

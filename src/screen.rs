@@ -1,4 +1,5 @@
 use std::{
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -16,13 +17,20 @@ use idevice::{
 };
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{Error, Result, h264, phone};
+use crate::{Error, Result, h264, phone, picture::Picture, video};
 
 // device hub sends 140, the phone's own bigger mask gets an unusable video setup
 const CLIENT_FEATURES: u64 = 140;
 
 const INPUT: Duration = Duration::from_secs(3);
-const STALLED: Duration = Duration::from_secs(5);
+// the phone sends a timing report every second even while the screen is still, silence past this means it's gone
+const SILENT: Duration = Duration::from_secs(5);
+// a still screen still comes as frames of about 0.5 KB, anything bigger means something on it changed
+const CHANGE_BYTES: usize = 1_000;
+// after a key frame the phone sends a few KB more touching up its quality, which isn't the screen changing
+const TOUCH_UP: Duration = Duration::from_millis(400);
+// past this the phone isn't going to send a key frame, so the frames since the last one get decoded instead
+const KEY_FRAME_WAIT: Duration = Duration::from_millis(2500);
 
 #[derive(Debug, Clone, Copy)]
 pub enum Input {
@@ -67,13 +75,39 @@ impl Button {
 
 enum Command {
     Input(Input),
-    KeyFrame(oneshot::Sender<Vec<u8>>),
+    Current(oneshot::Sender<Shot>),
+}
+
+/// frames to decode for the screen as it is, a lone key frame unless the phone wouldn't send one
+struct Shot {
+    number: u64,
+    frames: Vec<Vec<u8>>,
 }
 
 /// a live screen sharing session with one phone, touches and keys only reach the phone while one is running
 pub struct Session {
     commands: mpsc::UnboundedSender<Command>,
     thread: Option<thread::JoinHandle<()>>,
+    activity: Arc<Mutex<Activity>>,
+    // the png of an unchanged screen is the same, so a second screenshot of it costs nothing
+    made: Mutex<Option<(u64, Vec<u8>, u32, u32)>>,
+}
+
+struct Activity {
+    frames: u64,
+    changed_at: Option<Instant>,
+}
+
+// a still screen keeps coming as frames of about 0.5 KB, so a quarter second with nothing bigger means it's settled
+const QUIET_FOR: Duration = Duration::from_millis(250);
+
+impl Activity {
+    fn seen(&mut self, bytes: usize, key: bool) {
+        self.frames += 1;
+        if !key && bytes > CHANGE_BYTES {
+            self.changed_at = Some(Instant::now());
+        }
+    }
 }
 
 impl Session {
@@ -81,6 +115,11 @@ impl Session {
         let (commands, received) = mpsc::unbounded_channel();
         let (ready, started) = oneshot::channel();
         let udid = udid.to_string();
+        let activity = Arc::new(Mutex::new(Activity {
+            frames: 0,
+            changed_at: None,
+        }));
+        let seen = activity.clone();
         // the stream's futures aren't Send, so it gets its own thread and runtime
         let thread = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -88,7 +127,7 @@ impl Session {
                 .build()
                 .expect("runtime");
             let mut ready = Some(ready);
-            let result = runtime.block_on(run(&udid, received, &mut ready));
+            let result = runtime.block_on(run(&udid, received, &mut ready, &seen));
             if let Err(e) = result {
                 match ready.take() {
                     Some(ready) => {
@@ -101,6 +140,8 @@ impl Session {
         let session = Session {
             commands,
             thread: Some(thread),
+            activity,
+            made: Mutex::new(None),
         };
         match tokio::time::timeout(Duration::from_secs(30), started).await {
             Ok(Ok(Ok(()))) => Ok(session),
@@ -122,20 +163,70 @@ impl Session {
             .map_err(|_| Error::Other("Screen sharing with the iPhone stopped. Try again.".into()))
     }
 
-    /// the next full picture of the screen as h.264, asked for fresh so it shows the screen as it is now
-    pub async fn key_frame(&self) -> Result<Vec<u8>> {
-        let (reply, frame) = oneshot::channel();
-        self.commands
-            .send(Command::KeyFrame(reply))
-            .map_err(|_| Error::Other("Screen sharing with the iPhone stopped. Try again.".into()))?;
-        match tokio::time::timeout(Duration::from_secs(10), frame).await {
-            Ok(Ok(frame)) => Ok(frame),
-            Ok(Err(_)) => Err(Error::Other(
-                "Screen sharing with the iPhone stopped. Try again.".into(),
-            )),
-            Err(_) => Err(Error::Other(
-                "The iPhone didn't send a picture of its screen in time.".into(),
-            )),
+    /// the frames to decode for the screen as it is now, a lone key frame unless the phone wouldn't send one, and
+    /// the number of the last, which stays the same while the screen does
+    pub async fn frames(&self) -> Result<(u64, Vec<Vec<u8>>)> {
+        let (reply, shot) = oneshot::channel();
+        let stopped = || Error::Other("Screen sharing with the iPhone stopped. Try again.".into());
+        self.commands.send(Command::Current(reply)).map_err(|_| stopped())?;
+        match tokio::time::timeout(KEY_FRAME_WAIT * 2, shot).await {
+            Ok(Ok(shot)) => Ok((shot.number, shot.frames)),
+            Ok(Err(_)) => Err(stopped()),
+            Err(_) => Err(Error::Other("The iPhone didn't send a picture of its screen in time.".into())),
+        }
+    }
+
+    /// the screen as it is now, instant when it hasn't changed since the last key frame
+    pub async fn picture(&self) -> Result<Picture> {
+        let (number, frames) = self.frames().await?;
+        if let Some((made, png, width, height)) = self.made.lock().expect("lock").as_ref()
+            && *made == number
+        {
+            return Ok(Picture {
+                png: png.clone(),
+                width: *width,
+                height: *height,
+            });
+        }
+        let picture = tokio::task::spawn_blocking(move || video::picture(&frames))
+            .await
+            .map_err(|e| Error::Other(e.to_string()))??;
+        *self.made.lock().expect("lock") = Some((number, picture.png.clone(), picture.width, picture.height));
+        Ok(picture)
+    }
+
+    /// waits until the screen has stopped changing, or `longest` for screens that never do, like a playing video
+    pub async fn settle(&self, longest: Duration) {
+        let since = Instant::now();
+        // a still screen means nothing until the phone has started reacting, an action that changes nothing shows
+        // no change within this
+        let react = Duration::from_millis(600);
+        loop {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            if self
+                .activity
+                .lock()
+                .expect("lock")
+                .changed_at
+                .is_some_and(|at| at > since)
+            {
+                break;
+            }
+            if since.elapsed() > react {
+                return;
+            }
+        }
+        while since.elapsed() < longest {
+            if self
+                .activity
+                .lock()
+                .expect("lock")
+                .changed_at
+                .is_some_and(|at| at.elapsed() > QUIET_FOR)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
         }
     }
 
@@ -168,6 +259,7 @@ async fn run(
     udid: &str,
     mut commands: mpsc::UnboundedReceiver<Command>,
     ready: &mut Option<oneshot::Sender<Result<()>>>,
+    activity: &Mutex<Activity>,
 ) -> Result<()> {
     let provider = phone::provider(udid).await?;
     if let Some((major, ios)) = phone::ios_major(&provider).await
@@ -189,8 +281,16 @@ async fn run(
     // after a lost packet every frame is broken until the next key frame
     let mut broken = false;
     let mut setup = Setup::default();
-    let mut waiting: Vec<oneshot::Sender<Vec<u8>>> = Vec::new();
-    let mut waiting_since: Option<Instant> = None;
+    let mut heard = Instant::now();
+    // the frames since the last key frame, starting with it, and the number of the last one
+    let mut run: Vec<Vec<u8>> = Vec::new();
+    let mut last = 0u64;
+    let mut key_number = 0u64;
+    let mut key_at = Instant::now();
+    let mut changed = false;
+    let mut last_change = Instant::now();
+    let mut asking: Vec<(Instant, oneshot::Sender<Shot>)> = Vec::new();
+    let mut check = tokio::time::interval(Duration::from_millis(100));
 
     let result = loop {
         tokio::select! {
@@ -199,6 +299,7 @@ async fn run(
                     Ok(d) => d,
                     Err(e) => break Err(e.into()),
                 };
+                heard = Instant::now();
                 // the phone's rtcp timing reports come in on the same port, they'd read as broken video packets
                 if is_rtcp(&datagram.data) {
                     continue;
@@ -237,22 +338,44 @@ async fn run(
                 if let Some(ready) = ready.take() {
                     let _ = ready.send(Ok(()));
                 }
+                let number = {
+                    let mut seen = activity.lock().expect("lock");
+                    seen.seen(data.len(), key);
+                    seen.frames
+                };
                 if key {
-                    for reply in waiting.drain(..) {
-                        let _ = reply.send(data.clone());
+                    for (_, reply) in asking.drain(..) {
+                        let _ = reply.send(Shot { number, frames: vec![data.clone()] });
                     }
-                    waiting_since = None;
+                    run.clear();
+                    changed = false;
+                    key_number = number;
+                    key_at = Instant::now();
+                } else if data.len() > CHANGE_BYTES && key_at.elapsed() > TOUCH_UP {
+                    changed = true;
+                    last_change = Instant::now();
+                }
+                if key || !run.is_empty() {
+                    run.push(data);
+                    last = number;
+                }
+            }
+            _ = check.tick() => {
+                // asking as soon as the screen settles means the key frame is usually here before anyone wants it
+                if changed && (last_change.elapsed() > Duration::from_millis(250) || !asking.is_empty()) {
+                    feedback.ask_for_key_frame(&screen.video, false).await;
+                }
+                if asking.first().is_some_and(|(since, _)| since.elapsed() > KEY_FRAME_WAIT) {
+                    for (_, reply) in asking.drain(..) {
+                        let _ = reply.send(Shot { number: last, frames: run.clone() });
+                    }
                 }
             }
             _ = alive.tick() => {
                 feedback.still_watching(&screen.video).await;
-                // the phone answers a key frame request within a few frames, silence means it stopped sending,
                 // ending here lets the next request start a fresh session instead of waiting forever
-                if waiting_since.is_some_and(|since| since.elapsed() > STALLED) {
+                if heard.elapsed() > SILENT {
                     break Err(Error::Other("The iPhone stopped sending its screen.".into()));
-                }
-                if !waiting.is_empty() {
-                    feedback.ask_for_key_frame(&screen.video, false).await;
                 }
             }
             command = commands.recv() => match command {
@@ -266,11 +389,16 @@ async fn run(
                             controls = Controls::default();
                         }
                     }
+                    // the phone's reports pile up unread while a send is stuck, that time isn't the phone going quiet
+                    heard = heard.max(Instant::now() - Duration::from_secs(1));
                 }
-                Some(Command::KeyFrame(reply)) => {
-                    waiting.push(reply);
-                    waiting_since.get_or_insert_with(Instant::now);
-                    feedback.ask_for_key_frame(&screen.video, true).await;
+                Some(Command::Current(reply)) => {
+                    if !changed && !run.is_empty() {
+                        let _ = reply.send(Shot { number: key_number, frames: vec![run[0].clone()] });
+                    } else {
+                        asking.push((Instant::now(), reply));
+                        feedback.ask_for_key_frame(&screen.video, true).await;
+                    }
                 }
                 None => break Ok(()),
             },
